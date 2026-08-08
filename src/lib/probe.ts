@@ -6,7 +6,7 @@
 
 import { DIRECT, viaProxy, type Transport } from "./transport";
 
-export type ProbeKind = "models" | "health" | "root" | "ollama" | "other";
+export type ProbeKind = "models" | "health" | "root" | "ollama" | "chat" | "other";
 
 export type ProbeResult = {
   id: string;
@@ -97,6 +97,30 @@ export function authHeaders(apiKey: string): Record<string, string> {
   const k = apiKey.trim();
   if (!k) return {};
   return { Authorization: `Bearer ${k}`, "api-key": k };
+}
+
+/**
+ * Chat-completions specific candidates, most-standard-first. Most OpenAI-compatible
+ * gateways only implement the `/v1/...` path — plain `/chat/completions` (no version)
+ * is comparatively rare, so it must never be tried before `/v1/chat/completions`.
+ */
+export function chatCompletionsCandidates(rootOrBase: string): string[] {
+  const root = rootOrBase.replace(/\/v\d+$/i, "").replace(/\/+$/, "");
+  const out: string[] = [];
+  const push = (u: string) => {
+    if (!out.includes(u)) out.push(u);
+  };
+  // If the user's input already carried an explicit version segment, respect it first.
+  if (/\/v\d+$/i.test(rootOrBase)) push(`${rootOrBase.replace(/\/+$/, "")}/chat/completions`);
+  push(`${root}/v1/chat/completions`);
+  push(`${root}/chat/completions`);
+  push(`${root}/openai/v1/chat/completions`);
+  push(`${root}/api/v1/chat/completions`);
+  return out;
+}
+
+export function chatUrlToBase(url: string): string {
+  return url.replace(/\/chat\/completions\/?$/i, "");
 }
 
 export type FetchOutcome = {
@@ -212,12 +236,35 @@ export function extractModels(json: any): DiscoveredModel[] {
 export type ScanReport = {
   base: string;
   probes: ProbeResult[];
+  chatProbes: ProbeResult[];
   workingBase: string | null;
+  /** Base URL to use specifically for /chat/completions — defaults to the /v1 path. */
+  chatBase: string | null;
   models: DiscoveredModel[];
   needsKey: boolean;
   corsBlocked: boolean;
   bestLatency: number | null;
 };
+
+/**
+ * Sends a deliberately-invalid chat.completions POST (fake model, 1 token) to see
+ * whether the *route itself* exists. A 404 means "wrong path" — everything else
+ * (400 bad model, 401/403 auth, 422, 429, even 500) proves the route is real.
+ */
+async function verifyChatRoute(
+  url: string,
+  apiKey: string,
+  transport: Transport,
+): Promise<{ status: number | null; latencyMs: number; error?: string; hint?: string }> {
+  const headers = { "Content-Type": "application/json", Accept: "application/json", ...authHeaders(apiKey) };
+  const body = JSON.stringify({
+    model: "___endpoint-tester-probe___",
+    messages: [{ role: "user", content: "ping" }],
+    max_tokens: 1,
+  });
+  const r = await timedFetch(url, { method: "POST", headers, body }, 8000, transport);
+  return { status: r.status, latencyMs: r.latencyMs, error: r.error, hint: r.hint };
+}
 
 /** Probe a set of well-known paths and figure out which base URL actually works. */
 export async function scanEndpoint(
@@ -280,13 +327,47 @@ export async function scanEndpoint(
   const reachable = results.filter((p) => p.status !== null);
   const bestLatency = reachable.length ? Math.min(...reachable.map((p) => p.latencyMs)) : null;
 
+  // Verify the actual /chat/completions route independently of /models — a gateway can
+  // expose one without the other, and defaulting to whichever base answered /models first
+  // (which might be the bare, un-versioned domain) is exactly what causes "worked for some
+  // endpoints, 404s on others". /v1/chat/completions is tried first, always.
+  const chatTargets = chatCompletionsCandidates(base);
+  const chatResults = await Promise.all(
+    chatTargets.map(async (url, i) => {
+      const r = await verifyChatRoute(url, apiKey, transport);
+      const status = r.status;
+      const notFound = status === 404;
+      const p: ProbeResult = {
+        id: `chat-${i}-${url}`,
+        label: `POST ${url}`,
+        url,
+        kind: "chat",
+        ok: status !== null && !notFound,
+        status,
+        statusText: "",
+        latencyMs: r.latencyMs,
+        error: r.error,
+        hint: notFound ? "Route not found at this path." : r.hint,
+        requiresAuth: status === 401 || status === 403,
+      };
+      onProbe?.(p);
+      return p;
+    }),
+  );
+  probes.push(...chatResults);
+
+  const chatHit = chatResults.find((p) => p.ok);
+  const chatBase = chatHit ? chatUrlToBase(chatHit.url) : workingBase;
+
   return {
     base,
     probes: results,
+    chatProbes: chatResults,
     workingBase,
+    chatBase,
     models: dedupeModels(models),
     needsKey: !!authProbe && !modelProbe,
-    corsBlocked: reachable.length === 0,
+    corsBlocked: reachable.length === 0 && chatResults.every((p) => p.status === null),
     bestLatency,
   };
 }

@@ -1,6 +1,18 @@
 import OpenAI from "openai";
-import { authHeaders, explainNetworkError } from "./probe";
+import { authHeaders, chatUrlToBase, explainNetworkError } from "./probe";
 import { DIRECT, viaProxy, type Transport } from "./transport";
+
+/**
+ * When a (possibly user-edited) chat-completions URL still ends in the standard
+ * `/chat/completions` suffix, we can route it through the OpenAI SDK by handing
+ * it the base URL — same request, but we get SDK parsing/retry semantics for free.
+ * Anything else (custom path, different suffix, extra segment) falls back to a
+ * plain fetch that hits the URL byte-for-byte.
+ */
+export function deriveSdkBase(url: string): string | null {
+  if (!/\/chat\/completions\/?(\?.*)?$/i.test(url)) return null;
+  return chatUrlToBase(url.replace(/\?.*$/, ""));
+}
 
 export type ChatTestResult = {
   model: string;
@@ -15,8 +27,9 @@ export type ChatTestResult = {
   tokensPerSec: number | null;
   usage?: { prompt?: number; completion?: number; total?: number };
   finishReason?: string | null;
-  transport: "sdk-stream" | "sdk-json";
+  transport: "sdk-stream" | "sdk-json" | "raw-stream" | "raw-json";
   requestBody: any;
+  url?: string;
 };
 
 /** The SDK requires a non-empty key; keyless servers ignore it. */
@@ -159,25 +172,168 @@ export async function runChatTest(opts: ChatOptions): Promise<ChatTestResult> {
   }
 }
 
-/** Raw fetch fallback — useful when the SDK's shape assumptions break. */
-export async function rawChatTest(opts: Omit<ChatOptions, "onDelta">) {
-  const url = viaProxy(`${opts.baseURL}/chat/completions`, opts.transport ?? DIRECT);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders(opts.apiKey) },
-    body: JSON.stringify({
+export type RawChatOptions = {
+  url: string;
+  apiKey: string;
+  model: string;
+  prompt: string;
+  system?: string;
+  temperature?: number;
+  maxTokens?: number;
+  stream: boolean;
+  timeoutMs?: number;
+  transport?: Transport;
+  onDelta?: (chunk: string) => void;
+};
+
+/**
+ * Hits an exact URL directly with fetch — used whenever the user overrides the
+ * endpoint with a path the OpenAI SDK can't express (i.e. it doesn't end in
+ * `/chat/completions`). Parses SSE by hand so streaming still works.
+ */
+export async function runChatTestAtUrl(opts: RawChatOptions): Promise<ChatTestResult> {
+  const messages: any[] = [];
+  if (opts.system?.trim()) messages.push({ role: "system", content: opts.system.trim() });
+  messages.push({ role: "user", content: opts.prompt });
+
+  const requestBody: any = {
+    model: opts.model,
+    messages,
+    temperature: opts.temperature ?? 0.2,
+    max_tokens: opts.maxTokens ?? 128,
+    stream: opts.stream,
+  };
+
+  const url = viaProxy(opts.url, opts.transport ?? DIRECT);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 60000);
+  const t0 = performance.now();
+  let ttft: number | null = null;
+  let chunks = 0;
+  let text = "";
+  let usage: ChatTestResult["usage"];
+  let finishReason: string | null = null;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: opts.stream ? "text/event-stream" : "application/json",
+        ...authHeaders(opts.apiKey),
+      },
+      body: JSON.stringify(requestBody),
+      signal: ctrl.signal,
+    });
+
+    if (opts.stream && res.body) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line || !line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") continue;
+          try {
+            const j = JSON.parse(payload);
+            if (j?.usage) {
+              usage = {
+                prompt: j.usage.prompt_tokens,
+                completion: j.usage.completion_tokens,
+                total: j.usage.total_tokens,
+              };
+            }
+            const delta = j?.choices?.[0]?.delta?.content ?? j?.choices?.[0]?.text ?? "";
+            if (j?.choices?.[0]?.finish_reason) finishReason = j.choices[0].finish_reason;
+            if (delta) {
+              if (ttft === null) ttft = Math.round(performance.now() - t0);
+              chunks++;
+              text += delta;
+              opts.onDelta?.(delta);
+            }
+          } catch {
+            /* partial/non-JSON SSE event, skip */
+          }
+        }
+      }
+      if (!res.ok) throw Object.assign(new Error(text || res.statusText || "request failed"), { status: res.status });
+    } else {
+      const bodyText = await res.text();
+      let j: any = null;
+      try {
+        j = bodyText ? JSON.parse(bodyText) : null;
+      } catch {
+        /* non-JSON body */
+      }
+      if (!res.ok) {
+        throw Object.assign(new Error(j?.error?.message || bodyText || res.statusText), { status: res.status });
+      }
+      text = j?.choices?.[0]?.message?.content ?? j?.choices?.[0]?.text ?? "";
+      finishReason = j?.choices?.[0]?.finish_reason ?? null;
+      chunks = 1;
+      if (j?.usage) {
+        usage = { prompt: j.usage.prompt_tokens, completion: j.usage.completion_tokens, total: j.usage.total_tokens };
+      }
+      opts.onDelta?.(text);
+    }
+
+    const totalMs = Math.round(performance.now() - t0);
+    const completionTokens = usage?.completion ?? Math.max(1, Math.round(text.length / 4));
+    const genMs = ttft !== null ? totalMs - ttft : totalMs;
+    return {
       model: opts.model,
-      messages: [{ role: "user", content: opts.prompt }],
-      max_tokens: opts.maxTokens ?? 64,
-      stream: false,
-    }),
-  });
-  return { status: res.status, body: await res.text() };
+      ok: true,
+      status: res.status,
+      url: opts.url,
+      text,
+      ttftMs: ttft,
+      totalMs,
+      chunks,
+      tokensPerSec: genMs > 0 ? Math.round((completionTokens / genMs) * 1000 * 10) / 10 : null,
+      usage,
+      finishReason,
+      transport: opts.stream ? "raw-stream" : "raw-json",
+      requestBody,
+    };
+  } catch (e: any) {
+    const totalMs = Math.round(performance.now() - t0);
+    const status = e?.status ?? null;
+    let hint: string | undefined;
+    if (status === 401 || status === 403) hint = "Endpoint is alive but rejected the credentials — paste a valid API key.";
+    else if (status === 404) hint = "Route not found at this exact URL — try resetting to the auto-detected endpoint or toggling /v1.";
+    else if (status === 429) hint = "Rate limited — the endpoint works, just throttled.";
+    else if (status === 400) hint = "Endpoint responded but rejected the payload (unsupported param or bad model id).";
+    else if (status === null) hint = e?.name === "AbortError" ? "Timed out waiting for a response." : explainNetworkError(opts.url);
+    return {
+      model: opts.model,
+      ok: false,
+      status,
+      url: opts.url,
+      text,
+      error: e?.error?.message || e?.message || String(e),
+      hint,
+      ttftMs: ttft,
+      totalMs,
+      chunks,
+      tokensPerSec: null,
+      transport: opts.stream ? "raw-stream" : "raw-json",
+      requestBody,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-export function curlFor(o: { baseURL: string; apiKey: string; model: string; prompt: string }) {
+export function curlFor(o: { url: string; apiKey: string; model: string; prompt: string }) {
   const auth = o.apiKey.trim() ? `\\\n  -H "Authorization: Bearer ${o.apiKey.trim()}" ` : "";
-  return `curl ${o.baseURL}/chat/completions \\
+  return `curl ${o.url} \\
   -H "Content-Type: application/json" ${auth}\\
   -d '${JSON.stringify({ model: o.model, messages: [{ role: "user", content: o.prompt }] })}'`;
 }

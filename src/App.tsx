@@ -6,7 +6,7 @@ import { ChatPanel, type RunParams } from "./components/ChatPanel";
 import { LogPanel, type LogEntry } from "./components/LogPanel";
 import { Badge } from "./components/ui";
 import { pingSeries, scanEndpoint, type ScanReport } from "./lib/probe";
-import { runChatTest, type ChatTestResult } from "./lib/chat";
+import { deriveSdkBase, runChatTest, runChatTestAtUrl, type ChatTestResult } from "./lib/chat";
 import { storage } from "./lib/storage";
 import {
   detectProxy,
@@ -40,6 +40,7 @@ export default function App() {
   const [output, setOutput] = useState("");
   const [result, setResult] = useState<ChatTestResult | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [chatUrlOverride, setChatUrlOverride] = useState("");
   const stopBatch = useRef(false);
   // Read once on first render, before the persistence effect writes a default.
   const hadSavedMode = useRef(storage.get(LS_MODE) !== "");
@@ -106,6 +107,7 @@ export default function App() {
       setBatch({});
       setResult(null);
       setOutput("");
+      if (!isRetry) setChatUrlOverride("");
       log("info", `scan → ${endpoint} · ${t.mode} mode${apiKey ? " · with key" : " · keyless"}`);
       try {
         const r = await scanEndpoint(
@@ -146,7 +148,16 @@ export default function App() {
         } else {
           log("warn", "reachable, but no model list returned");
         }
-        if (r.workingBase) log("ok", `resolved base URL: ${r.workingBase}`);
+        if (r.workingBase) log("ok", `resolved models base URL: ${r.workingBase}`);
+        if (r.chatBase) {
+          const usedV1 = /\/v\d+$/i.test(r.chatBase);
+          log(
+            "ok",
+            `resolved chat completions endpoint: ${r.chatBase}/chat/completions${usedV1 ? "" : "  ⚠ no /v1 segment — unusual, double-check with the edit button if it 404s"}`,
+          );
+        } else {
+          log("warn", "couldn't verify a working /chat/completions route — defaulting to /v1, edit it manually if needed");
+        }
       } catch (e: any) {
         log("err", `scan failed: ${e?.message || e}`);
       } finally {
@@ -172,42 +183,70 @@ export default function App() {
     log("ok", "ping series complete");
   }, [pingTarget, apiKey, log, transport]);
 
+  // Resolved default = /v1/chat/completions of whichever base actually answered the
+  // dedicated chat-route probe (falls back to the /models base if that check failed).
+  const defaultChatUrl = useMemo(() => {
+    const base = report?.chatBase || report?.workingBase;
+    return base ? `${base}/chat/completions` : null;
+  }, [report]);
+
   const handleRun = useCallback(
     async (p: RunParams) => {
-      const base = report?.workingBase;
-      if (!base || !model) return;
+      const url = chatUrlOverride.trim() || defaultChatUrl;
+      if (!url || !model) return;
       setRunning(true);
       setOutput("");
       setResult(null);
-      log("info", `POST ${base}/chat/completions · model=${model} · stream=${p.stream} · ${transport.mode}`);
-      const r = await runChatTest({
-        baseURL: base,
-        apiKey,
-        model,
-        prompt: p.prompt,
-        system: p.system,
-        stream: p.stream,
-        temperature: p.temperature,
-        maxTokens: p.maxTokens,
-        transport,
-        onDelta: (d) => setOutput((o) => o + d),
-      });
+      const sdkBase = deriveSdkBase(url);
+      log(
+        "info",
+        `POST ${url} · model=${model} · stream=${p.stream} · ${transport.mode} · ${sdkBase ? "openai-sdk" : "raw fetch (custom path)"}`,
+      );
+      const r = sdkBase
+        ? await runChatTest({
+            baseURL: sdkBase,
+            apiKey,
+            model,
+            prompt: p.prompt,
+            system: p.system,
+            stream: p.stream,
+            temperature: p.temperature,
+            maxTokens: p.maxTokens,
+            transport,
+            onDelta: (d) => setOutput((o) => o + d),
+          })
+        : await runChatTestAtUrl({
+            url,
+            apiKey,
+            model,
+            prompt: p.prompt,
+            system: p.system,
+            stream: p.stream,
+            temperature: p.temperature,
+            maxTokens: p.maxTokens,
+            transport,
+            onDelta: (d) => setOutput((o) => o + d),
+          });
       setResult(r);
       setRunning(false);
       if (r.ok) log("ok", `200 OK · ttft ${r.ttftMs ?? "-"} ms · total ${r.totalMs} ms · ${r.tokensPerSec ?? "-"} tok/s`);
-      else log("err", `${r.status ?? "network"} · ${r.error}`);
+      else {
+        log("err", `${r.status ?? "network"} · ${r.error}`);
+        if (r.status === 404)
+          log("warn", "404 at this exact path — try the ✎ edit button on the endpoint bar to toggle /v1 or use a custom route");
+      }
     },
-    [report, model, apiKey, log, transport],
+    [chatUrlOverride, defaultChatUrl, model, apiKey, log, transport],
   );
 
   const handleBatch = useCallback(
     async (ids: string[]) => {
-      const base = report?.workingBase;
+      const base = report?.chatBase || report?.workingBase;
       if (!base) return;
       stopBatch.current = false;
       setBatching(true);
       setBatch(Object.fromEntries(ids.map((id) => [id, { state: "queued" } as BatchResult])));
-      log("info", `batch test of ${ids.length} model(s) — 1 short prompt each`);
+      log("info", `batch test of ${ids.length} model(s) against ${base}/chat/completions`);
 
       const queue = [...ids];
       const worker = async () => {
@@ -305,7 +344,9 @@ export default function App() {
           <div className="space-y-4 lg:col-span-7">
             <ChatPanel
               model={model}
-              baseURL={workingBase}
+              defaultUrl={defaultChatUrl}
+              overrideUrl={chatUrlOverride}
+              onOverrideChange={setChatUrlOverride}
               apiKey={apiKey}
               onRun={handleRun}
               running={running}

@@ -13,7 +13,9 @@ export type RunParams = {
 
 export function ChatPanel({
   model,
-  baseURL,
+  defaultUrl,
+  overrideUrl,
+  onOverrideChange,
   apiKey,
   onRun,
   running,
@@ -21,7 +23,9 @@ export function ChatPanel({
   result,
 }: {
   model: string;
-  baseURL: string | null;
+  defaultUrl: string | null;
+  overrideUrl: string;
+  onOverrideChange: (v: string) => void;
   apiKey: string;
   onRun: (p: RunParams) => void;
   running: boolean;
@@ -34,10 +38,13 @@ export function ChatPanel({
   const [temperature, setTemperature] = useState(0.2);
   const [maxTokens, setMaxTokens] = useState(128);
   const [showCurl, setShowCurl] = useState(false);
+  const [editingUrl, setEditingUrl] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const ready = !!baseURL && !!model;
-  const curl = curlFor({ baseURL: baseURL || "<base-url>", apiKey, model: model || "<model>", prompt });
+  const isCustom = overrideUrl.trim().length > 0 && overrideUrl.trim() !== defaultUrl;
+  const effectiveUrl = overrideUrl.trim() || defaultUrl;
+  const ready = !!effectiveUrl && !!model;
+  const curl = curlFor({ url: effectiveUrl || "<endpoint-url>", apiKey, model: model || "<model>", prompt });
 
   return (
     <Card
@@ -45,7 +52,7 @@ export function ChatPanel({
       subtitle={
         ready ? (
           <span className="font-mono">
-            POST {baseURL}/chat/completions · {model}
+            POST {effectiveUrl} · {model}
           </span>
         ) : (
           "Pick a model first"
@@ -73,6 +80,51 @@ export function ChatPanel({
       }
     >
       <div className="space-y-3">
+        <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[10px] uppercase tracking-wider text-slate-500">Chat completions endpoint</span>
+            <div className="flex items-center gap-1.5">
+              <Badge tone={isCustom ? "violet" : "good"}>{isCustom ? "custom" : "auto · /v1"}</Badge>
+              {isCustom && (
+                <button
+                  onClick={() => onOverrideChange("")}
+                  title="Revert to the auto-detected endpoint"
+                  className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-slate-500 hover:text-emerald-300"
+                >
+                  ↺ reset
+                </button>
+              )}
+              <button
+                onClick={() => setEditingUrl((s) => !s)}
+                title="Edit the exact URL used for this test"
+                className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-slate-500 hover:text-slate-200"
+              >
+                {editingUrl ? "done" : "✎ edit"}
+              </button>
+            </div>
+          </div>
+          {editingUrl ? (
+            <input
+              autoFocus
+              value={overrideUrl || defaultUrl || ""}
+              onChange={(e) => onOverrideChange(e.target.value)}
+              spellCheck={false}
+              placeholder="https://host/v1/chat/completions"
+              className="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-1.5 font-mono text-xs text-slate-100 placeholder-slate-600 outline-none focus:border-emerald-500/60"
+            />
+          ) : (
+            <div className="truncate rounded-lg border border-slate-800/70 bg-black/40 px-3 py-1.5 font-mono text-xs text-slate-300">
+              {effectiveUrl || <span className="text-slate-600">— run a scan to auto-detect —</span>}
+            </div>
+          )}
+          <p className="mt-1.5 text-[10.5px] leading-relaxed text-slate-600">
+            Defaults to <code className="text-slate-400">/v1/chat/completions</code> (the standard almost every
+            OpenAI-compatible host uses). Edit it if this gateway needs a different path — e.g. no{" "}
+            <code className="text-slate-400">/v1</code>, a custom prefix, or the legacy{" "}
+            <code className="text-slate-400">/v1/completions</code> route.
+          </p>
+        </div>
+
         <div className="grid gap-3 lg:grid-cols-2">
           <div className="space-y-2">
             <textarea

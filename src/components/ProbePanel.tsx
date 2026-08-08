@@ -96,6 +96,45 @@ export function ProbePanel({
             </table>
           </div>
 
+          {!!report.chatProbes?.length && (
+            <div className="overflow-hidden rounded-lg border border-slate-800">
+              <div className="flex items-center justify-between bg-slate-950/60 px-3 py-2">
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">
+                  Chat completions route check (POST, fake model — 404 means wrong path)
+                </span>
+                {report.chatBase ? (
+                  <Badge tone="good">using {report.chatBase}/chat/completions</Badge>
+                ) : (
+                  <Badge tone="bad">none confirmed</Badge>
+                )}
+              </div>
+              <table className="w-full text-left text-xs">
+                <tbody className="divide-y divide-slate-800/70">
+                  {report.chatProbes.map((p) => {
+                    const d = describeStatus(p.status);
+                    const isChosen = report.chatBase && p.url.startsWith(report.chatBase) && p.ok;
+                    return (
+                      <tr key={p.id} className={`slide-up transition ${isChosen ? "bg-emerald-500/5" : "hover:bg-slate-800/30"}`}>
+                        <td className="max-w-[1px] truncate px-3 py-2 font-mono text-slate-300" title={p.url}>
+                          {isChosen && <span className="mr-1 text-emerald-400">✓</span>}
+                          {p.label}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          <Badge tone={p.status === 404 ? "bad" : p.ok ? "good" : d.tone}>
+                            {p.status ?? "—"} {p.status === 404 ? "wrong path" : p.ok ? "route exists" : d.label}
+                          </Badge>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2 text-right font-mono text-slate-400">
+                          {p.status === null ? <span className="text-rose-400">fail</span> : `${p.latencyMs} ms`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {(samples.length > 0 || pinging) && (
             <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-3">
               <div className="mb-2 flex items-center justify-between text-[10px] uppercase tracking-wider text-slate-500">

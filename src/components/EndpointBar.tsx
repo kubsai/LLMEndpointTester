@@ -172,8 +172,15 @@ export function EndpointBar({
           {report?.workingBase && (
             <>
               <span className="text-slate-700">→</span>
-              <Badge tone="good">resolved</Badge>
+              <Badge tone="good">models</Badge>
               <span className="text-emerald-300">{report.workingBase}</span>
+            </>
+          )}
+          {report?.chatBase && (
+            <>
+              <span className="text-slate-700">·</span>
+              <Badge tone="violet">chat</Badge>
+              <span className="text-violet-300">{report.chatBase}/chat/completions</span>
             </>
           )}
           {!apiKey.trim() && <Badge tone="violet">keyless mode</Badge>}
